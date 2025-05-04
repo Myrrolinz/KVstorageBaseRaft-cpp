@@ -87,7 +87,16 @@ logs are being appended, not committed. no nodes knows if the leader is able to 
 
 leader wait for response. more than 1/2 ok means success. Then the leader go ahead and commit the log. it will tell the follower to commit too.
 
-leader send curr and prev entry
+When the leader sends an `AppendEntries` RPC to a follower, it includes:
+
+- `prevLogIndex`: Index of the log entry immediately preceding the new ones.
+- `prevLogTerm`: Term of the `prevLogIndex` entry.
+
+if not matched, The leader maintains a `nextIndex[i]` array:
+
+- It records the index of the **next log entry** it wants to send to follower `i` (decrement).
+
+until the follower finds a match.
 
 FSM end up with the same state
 
@@ -156,6 +165,8 @@ else
     newer = higher index;
 ```
 
+if client sent a request while the leader dies, it has to retry.
+
 #### 4. Log Replication and Heartbeat
 
 Heartbeat and log sync use the same `AppendEntryRPC`.
@@ -181,11 +192,33 @@ How is this ensured?
 
 Consensus Theory: Once a decision is made by a majority, it's **final** and **safe** (cannot be overwritten). Even if a minority of nodes fail, the system continues. If a majority fails, the system halts safely (but never gives wrong results).
 
+#### 5. Snapshot
+
+1. **Snapshots are local optimizations**
+
+- Each node (leader or follower) **independently** takes a snapshot of its state machine to avoid unbounded log growth.
+- The **snapshot saves the state up to a specific log index**, allowing the node to safely discard older log entries.
+
+2. **Leader and follower snapshots are not synchronized**
+
+- The **leader** might take a snapshot at a different time than its followers.
+- Followers may lag behind or advance based on their log replication status and local policies (e.g. memory pressure or configured snapshot interval).
+
+3. **Index coordination is handled via `InstallSnapshot` RPC**
+
+- If a follower falls too far behind (e.g. it’s missing log entries that the leader has already compacted), the **leader will send an `InstallSnapshot` RPC**.
+- This RPC brings the follower’s state machine and log index **up to the leader’s latest snapshot index**.
+
+4. **Snapshot index advancement**
+
+- Each node keeps track of the **last included index and term** in the snapshot.
+- Once a snapshot is taken, those log entries prior to that index can be safely deleted.
+
 ## Source code
 
 ### src
 
-#### raft.h
+#### raft
 
 - `#ifndef RAFT_H`: **include guards**. This checks if the macro `RAFT_H` has **not** been defined.
 - `#define RAFT_H`: If it hasn't, this line defines it.
@@ -197,3 +230,242 @@ So, the **first time** the compiler includes this header, it defines `RAFT_H`, a
 If the file is included **again** later (in the same compilation unit), the `#ifndef` check will fail, and the compiler **skips** the entire file content.
 
 In modern C++ (since C++20), you can use: `#pragma once`
+
+
+
+about **syntax**:
+
+`const ::raftRpcProctoc::AppendEntriesArgs *request` means Start looking for `raftRpcProctoc` in the **global namespace**, not any nested or local one.
+
+`const raftRpcProctoc::AppendEntriesArgs *request` means Start looking for `raftRpcProctoc` in the **current scope**, then parent scopes, then global
+
+A **nested class** is a class defined **inside the scope of another class**.
+
+**Syntactic sugar**. The `&` operator is overloaded so that:
+
+- When you're **writing (saving)** data:
+   `ar & data;` acts like `ar << data;`
+- When you're **reading (loading)** data:
+   `ar & data;` acts like `ar >> data;`
+
+This makes it **bidirectional** — one unified syn
+
+
+
+focus on:
+
+**Main Raft Workflow**:
+
+- **Leader Election**: via `sendRequestVote` and `RequestVote`
+- **Log Replication & Heartbeats**: via `sendAppendEntries` and `AppendEntries`
+
+**Timer Management**:
+
+- `applierTicker`: periodically writes committed log entries to the state machine
+- `leaderHearBeatTicker`: maintains heartbeat from the leader
+- `electionTimeOutTicker`: triggers an election when no heartbeat is received within a timeout
+
+**Persistence**:
+
+- **What to persist**: includes current term, voted candidate, and log entries
+- **When to persist**: persistence occurs when these values change, via the `persist()` function
+
+
+
+```C++
+  m_ioManager = std::make_unique<monsoon::IOManager>(FIBER_THREAD_NUM, FIBER_USE_CALLER_THREAD);
+
+  // start ticker fiber to start elections
+  // 启动三个循环定时器
+  // todo:原来是启动了三个线程，现在是直接使用了协程，三个函数中leaderHearBeatTicker
+  // 、electionTimeOutTicker执行时间是恒定的，applierTicker时间受到数据库响应延迟和两次apply之间请求数量的影响，这个随着数据量增多可能不太合理，最好其还是启用一个线程。
+  m_ioManager->scheduler([this]() -> void { this->leaderHearBeatTicker(); });
+  m_ioManager->scheduler([this]() -> void { this->electionTimeOutTicker(); });
+
+  std::thread t3(&Raft::applierTicker, this);
+  t3.detach();
+```
+
+- **Schedule `leaderHearBeatTicker()` and `electionTimeOutTicker()` to run as fibers.**
+- Each ticker function:
+  - runs a **loop** that periodically performs:
+    - Leader: sends heartbeats
+    - Follower/candidate: checks for election timeout and starts election if needed
+
+➡️ These **tickers execute periodically** with **constant timing**, making sure that Raft’s time-based behaviors (elections, heartbeats) function properly.
+
+for `applierTicker`, it has to use thread because fibers cannot handle blocking operations. if it blocks, the entire thread running that fiber is blocked. no other fiber on that thread can run.
+
+
+
+### election
+
+**electionTimeOutTicker**
+
+![image-20250503124556313](assets/image-20250503124556313.png)
+
+- **`electionTimeOutTicker`:**
+   Responsible for checking whether an election should be initiated. If so, it calls `doElection` to start the election.
+- **`doElection`:**
+   Actually initiates the election by constructing the necessary RPCs and using multiple threads to call `sendRequestVote` to handle the RPCs and responses.
+
+- **`sendRequestVote`:**
+   Responsible for sending the election-related RPCs. After sending the RPCs, it also handles receiving and processing the responses from peers.
+
+- **`RequestVote`:**
+   Receives election requests from others and primarily checks whether it should vote for the requester.
+
+```C++
+while (true) {
+  if I'm the leader, sleep shortly and skip election logic;
+  calculate how long to sleep based on randomized timeout;
+  sleep for that duration;
+  if someone reset the election timer during sleep, skip election;
+  else, call doElection() to start the election;
+}
+```
+
+
+
+voting rules:
+
+Each **follower node** follows **strict rules** to decide whether to grant its vote:
+
+✅ A node **will vote for the candidate** *only if*:
+
+- The candidate’s term is **at least as up-to-date** as its own (`args->term >= m_currentTerm`).
+- The follower **has not already voted** in this term (`m_votedFor == -1` or `m_votedFor == candidateId`).
+- The candidate’s log is at least as up-to-date as the follower’s (based on `lastLogIndex` and `lastLogTerm`).
+
+❌ Otherwise, it **denies** the vote.
+
+
+
+`.get()` is a method on `std::shared_ptr<T>` that returns a **raw pointer** of type `T*`.
+
+mutex:
+
+```C++
+std::mutex m;
+
+m.lock();     // acquire the lock
+// critical section
+m.unlock();   // release the lock ❌ might forget this if there's a return or exception
+
+
+{
+    std::lock_guard<std::mutex> lg(m_mtx);
+    // critical section is protected
+}  // lg is destroyed here, and the mutex is automatically unlocked
+```
+
+
+
+the reason that we don't stop `sendRequestVote` when it become leader:
+
+`   std::thread t(&Raft::sendRequestVote, this, i, requestVoteArgs, requestVoteReply, votedNum);  // 创建新线程并执行b函数，并传递参数` Here **You can't "cancel" a detached thread** in C++ safely (there’s no built-in cooperative cancelation). The best way is to
+
+
+
+when to call `persist()`:
+
+1. After changing `currentTerm` or `votedFor`
+2. After appending new log entries
+3. After becoming follower due to receiving higher term
+
+
+
+```
+DEFER {
+    cleanup_function();
+};
+```
+
+Means:
+
+"Run cleanup_function() automatically when this scope ends."
+
+
+
+This snippet:
+
+```c++
+std::stringstream ss; // Acts like an in-memory file. Used to hold the serialized text data.
+
+boost::archive::text_oarchive oa(ss); // This creates an output archive that serializes objects into ss in a text-based format (like plain text or readable binary).
+
+oa << boostPersistRaftNode; // This writes the content of boostPersistRaftNode into the archive (and thus into ss) using Boost's reflection macros (BOOST_SERIALIZATION_*). All member fields that have serialize(...) defined will be included.
+
+return ss.str(); //Returns the full serialized result as a std::string.
+```
+
+is using **Boost.Serialization** to **serialize an object to a string** — specifically:
+
+> Convert the `boostPersistRaftNode` (a C++ struct/class) into a **string of bytes** that can be stored persistently (e.g., on disk or in memory).
+
+
+
+NOTICE:
+
+`std::shared_ptr<int> votedNum = std::make_shared<int>(1);`
+
+`std::shared_ptr` is thread-safe for copying and assigning the pointer itself — but not for accessing or modifying the object it points to.
+
+solution: use atomic or mutex.
+
+### log replication & heartbeat
+
+![image-20250503231945690](assets/image-20250503231945690.png)
+
+**`leaderHearBeatTicker`:**
+ Responsible for checking whether it's time to send a heartbeat. If so, it triggers `doHeartBeat`.
+
+**`doHeartBeat`:**
+ Actually sends the heartbeat. It constructs the necessary RPCs to be sent and uses multithreading to call `sendAppendEntries`, which handles both the sending of the RPC and processing of the response.
+
+**`sendAppendEntries`:**
+ Responsible for sending the log-related RPCs. After sending the RPC, it also handles receiving and processing the response from the peer.
+
+**`leaderSendSnapShot`:**
+ Responsible for sending snapshot RPCs. After sending the RPC, it also handles receiving and processing the response from the peer.
+
+**`AppendEntries`:**
+ Handles log requests sent by the leader. It mainly checks whether the current log matches and synchronizes the leader's log entries to the local node.
+
+**`InstallSnapshot`:**
+ Handles snapshot requests sent by the leader, synchronizing the snapshot to the local node.
+
+
+
+logic for `m_matchIndex` and `m_nextIndex`:
+
+1. **Leader sends logs** starting at `m_nextIndex[i]` to follower `i`.
+
+2. **Follower replies**: success or failure.
+
+   - If **success**:
+
+     - Leader updates:
+
+       ```
+       m_matchIndex[i] = new match index;
+       m_nextIndex[i] = m_matchIndex[i] + 1;
+       ```
+
+   - If **failure**:
+
+     - Follower is behind → leader decrements `m_nextIndex[i]` and retries.
+
+
+
+logic of `doHeartBeat`
+
+When triggered (by `leaderHearBeatTicker()`), `doHeartBeat()` does the following:
+
+- Ensures only the **leader** runs this.
+- Iterates over all **followers** (i.e., all peers except itself).
+- For each follower:
+  - If it’s too far behind → send a **snapshot** (via `InstallSnapshot` RPC).
+  - Otherwise → send **AppendEntries** RPC containing log entries or heartbeat.
+- Each operation runs in a **separate thread** for concurrency.
+- Resets the leader’s heartbeat timestamp after all sends are dispatched.
