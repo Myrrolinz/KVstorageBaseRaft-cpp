@@ -17,6 +17,11 @@ The **CAP Theorem** says that a distributed system can only **guarantee two out 
 - **CP** (Consistency + Partition tolerance)
 - **AP** (Availability + Partition tolerance)
 
+**RAII** stands for **Resource Acquisition Is Initialization**. 
+
+- When an object is created (constructed), it **acquires** some resource.
+- When the object goes out of scope (destroyed), its **destructor** automatically releases the resource.
+
 ------
 
 ### 2. **Consensus Protocol – Raft**
@@ -159,7 +164,7 @@ Raft is a **strong leader model**: only the leader handles client requests.
 Log freshness is determined by:
 
 ```
-cppCopyEditif (term1 != term2)
+if (term1 != term2)
     newer = higher term;
 else
     newer = higher index;
@@ -216,9 +221,14 @@ Consensus Theory: Once a decision is made by a majority, it's **final** and **sa
 
 ## Source code
 
-### src
+- example
+  - raftCoreExample:
+    - caller: initiate client to do `client.Put("x", std::to_string(tmp))`
+    - raftKvDB: 
 
-#### raft
+
+
+### raft
 
 - `#ifndef RAFT_H`: **include guards**. This checks if the macro `RAFT_H` has **not** been defined.
 - `#define RAFT_H`: If it hasn't, this line defines it.
@@ -469,3 +479,773 @@ When triggered (by `leaderHearBeatTicker()`), `doHeartBeat()` does the following
   - Otherwise → send **AppendEntries** RPC containing log entries or heartbeat.
 - Each operation runs in a **separate thread** for concurrency.
 - Resets the leader’s heartbeat timestamp after all sends are dispatched.
+
+
+
+
+
+follower maintain `m_lastResetElectionTime`, reset when:
+
+- Receiving a valid `AppendEntries` (heartbeat or log entry)
+- Receiving `InstallSnapshot`
+- Receiving a message from a **leader in a higher term**
+
+
+
+if `sendAppendEntries` failed (the follower's log is outdated), the retry happens in the next heartbeat.
+
+
+
+**Log Matching Property**
+
+If two logs contain an entry with the **same index and term**, then **all entries before that index are identical** in both logs.
+
+- This ensures that logs do not diverge once entries are committed.
+- This is enforced by the AppendEntries consistency check during replication.
+
+
+
+### Persistence
+
+Persistence refers to saving critical data to disk so that it won't be lost in case of a failure.
+
+What gets persisted?
+
+There are two main categories of data that are persisted:
+
+1. **Some Raft state information**:
+   - `m_currentTerm`: the current term of the node, used to avoid issues like duplicate votes.
+   - `m_votedFor`: the candidate this node voted for in the current term, to prevent double voting after a crash.
+   - `m_logs`: the complete log entries maintained by the Raft node.
+2. **Snapshot data from the key-value store (kvDb)**:
+   - `m_lastSnapshotIncludeIndex`: the highest log index included in the snapshot.
+   - `m_lastSnapshotIncludeTerm`: the term of the highest included log entry; corresponds to the above index.
+
+Why persist this data?
+
+There are two main reasons: **safety for consensus** and **performance optimization**.
+
+All persisted Raft state (except for snapshot data) ensures safety and correctness of the consensus algorithm.
+
+Snapshots, on the other hand, help reduce storage space. Since log entries are appended continuously, they can grow large over time—especially when variables are updated repeatedly. Snapshots compress logs by storing the current state directly (instead of every update), which saves space.
+
+When to persist?
+
+Persistence should happen whenever any of the important **state changes**—such as when **a new term starts** or **a new log entry is appended**.
+
+(You can check the `void Raft::persist()` function in the codebase for specifics.)
+
+Who triggers persistence?
+
+Anyone can technically trigger persistence, as long as the important state gets saved correctly. However, in this implementation, the `Raft` class itself handles it, because it's most aware of when its internal state changes.
+
+Note: Although persistence is time-consuming, **it must not release the lock during persistence**, to avoid race conditions with other threads modifying the data.
+
+How is persistence implemented?
+
+Persistence is inherently difficult because it must balance speed, data size, and binary safety. In this project, the Boost library is used to serialize the data into a `std::string`, which is then written to disk.
+
+### RPC
+
+In the gRPC / Protobuf RPC framework, each server-side RPC handler function is passed a `google::protobuf::Closure* done`, which represents a **callback** that must be invoked when the RPC has finished processing.
+
+```c++
+SomeRpcHandler(..., ::google::protobuf::Closure* done) {
+    // do stuff
+    done->Run(); // tells the RPC framework: "I’m done. Send the reply."
+}
+```
+
+✅ 1. **Client-side call from Raft (leader)**
+
+```c++
+bool RaftRpcUtil::InstallSnapshot(InstallSnapshotRequest* args, InstallSnapshotResponse* response) {
+  MprpcController controller;
+  stub_->InstallSnapshot(&controller, args, response, nullptr);
+  return !controller.Failed();
+}
+```
+
+- `stub_` is an instance of `raftRpc_Stub`, a **generated client stub**.
+- This makes the **RPC call** to the remote follower.
+
+✅ 2. **Client stub dispatches the call**
+
+```c++
+void raftRpc_Stub::InstallSnapshot(RpcController* controller,
+                                   const InstallSnapshotRequest* request,
+                                   InstallSnapshotResponse* response,
+                                   Closure* done) {
+  channel_->CallMethod(descriptor()->method(1),
+                       controller, request, response, done);
+}
+```
+
+- `CallMethod(...)` tells the RPC channel:
+
+  > "Send this method (InstallSnapshot) request to the remote server."
+
+- It uses:
+
+  - `descriptor()->method(1)` → picks the second method (InstallSnapshot) in the `.proto` service.
+
+So this is how the **RPC framework sends the request to the follower server**.
+
+✅ 3. **Server receives the call and dispatches it to `Raft`**
+
+On the follower side, the framework has registered the service implementation:
+
+```c++
+class Raft : public raftRpc { ... };
+```
+
+So when a request for `InstallSnapshot` arrives, it calls:
+
+```c++
+void Raft::InstallSnapshot(RpcController* controller,
+                           const InstallSnapshotRequest* request,
+                           InstallSnapshotResponse* response,
+                           Closure* done) {
+  InstallSnapshot(request, response);  // this calls your "real" logic
+  done->Run();                         // signal RPC completion
+}
+```
+
+This is the **server-side stub function**, and it's what the protobuf framework **expects to call** for this RPC method. It's the function that matches the `.proto` service definition.
+
+✅ 4. **Server logic is executed**
+
+```c++
+void Raft::InstallSnapshot(const InstallSnapshotRequest* request,
+                           InstallSnapshotResponse* response) {
+  // Your real business logic goes here:
+  // - Check term
+  // - Truncate logs
+  // - Save snapshot
+  // - Notify state machine
+}
+```
+
+This is the **actual implementation** of the InstallSnapshot logic for Raft.
+
+
+
+
+
+#### ProtoBuf
+
+https://blog.csdn.net/m0_74343467/article/details/136989016
+
+https://protobuf.dev/overview/
+
+```
+Client App
+  └── [request object] 
+        ↓
+UserServiceStub::Login()
+  └── MprpcChannel::CallMethod()
+        ↓
+   [varint(header_size) + rpc_header + args_str]
+        ↓
+     TCP Send →──────────────┐
+                             ↓
+                         TcpServer (Muduo)
+                             ↓
+                 RpcProvider::OnMessage()
+                             ↓
+      - Parse header
+      - Deserialize request
+      - Call service->CallMethod()
+                             ↓
+      Service::Login() executes
+                             ↓
+         Response object filled
+                             ↓
+     SendRpcResponse(conn, response)
+                             ↓
+   TCP Response ←────────────┘
+        ↓
+   Client parses response via recv()
+        ↓
+  response now populated and usable
+
+```
+
+#### rpc
+
+callFriendService -> `FiendServiceRpc_Stub::GetFriendsList` -> `CallMethod` -> `MprpcChannel::CallMethod` -> `RpcProvider::OnMessage` -> `google::protobuf::Closure` and `service->CallMethod(method, nullptr, request, response, done);` -> `FiendServiceRpc::CallMethod`
+
+| Stage                | Client Code                 | Server (Provider) Code               |
+| -------------------- | --------------------------- | ------------------------------------ |
+| 1. Connect           | `connect(fd, &server_addr)` | Muduo listens on `TcpServer`         |
+| 2. Handshake         | TCP 3-way handshake         | `accept()` (handled by Muduo)        |
+| 3. Notification      | —                           | `OnConnection()` is called           |
+| 4. Request sent      | `send(fd, rpc_data)`        | `OnMessage()` receives request       |
+| 5. Process & respond | —                           | `CallMethod()` → `SendRpcResponse()` |
+| 6. Response received | `recv()`                    | —                                    |
+
+```c++
+void FiendServiceRpc_Stub::GetFriendsList(::PROTOBUF_NAMESPACE_ID::RpcController* controller,
+                              const ::fixbug::GetFriendsListRequest* request,
+                              ::fixbug::GetFriendsListResponse* response,
+                              ::google::protobuf::Closure* done) {
+  channel_->CallMethod(descriptor()->method(0), // other method would be 1, 2, 3...
+                       controller, request, response, done);
+}
+```
+
+Here, it essentially calls `channel_->CallMethod`. The first parameter is `descriptor()->method(0)`, which identifies **which specific method** is being called (e.g., could be `Get`, `Put`, etc.). The other parameters are passed through unchanged.
+
+At this point, we have everything for a remote call: the **method name**, **request**, and **response**.
+
+Remember how we created the stub initially?
+
+```c++
+fixbug::FiendServiceRpc_Stub stub(new MprpcChannel(ip, port, true));
+```
+
+The `channel_` here is an instance of our custom `MprpcChannel`, so calling `channel_->CallMethod` is actually invoking `MprpcChannel::CallMethod`.
+
+
+
+CallMethod:
+
+<img src="assets/image-20250506213533589.png" alt="image-20250506213533589" style="zoom:80%;" />
+
+It **serializes** the required parameters and sends them via the `send()` function in a loop.
+
+
+
+This RPC implementation **does not support async calls**, because after sending the request, it blocks and waits for the response.
+
+
+
+Life Cycle of `m_eventLoop`
+
+1. You create a `TcpServer` and associate it with `m_eventLoop`
+
+2. You register callbacks like:
+
+   ```c++
+   server->setConnectionCallback(...);
+   server->setMessageCallback(...);
+   ```
+
+3. You call:
+
+   ```c++
+   server->start();        // begin listening
+   m_eventLoop.loop();     // start polling for events
+   ```
+
+4. `m_eventLoop`:
+
+   - Detects new connection → triggers `OnConnection()`
+   - Detects incoming data → triggers `OnMessage()`
+   - Detects write-ready sockets → handles pending writes
+   - Handles timers or signals if configured
+
+
+
+`std::bind`
+
+In C++, **member functions** (like `RpcProvider::OnConnection`) need a `this` pointer to operate, because they work on object instances.
+
+But when you register a callback like this:
+
+```c++
+server->setConnectionCallback(OnConnection);
+```
+
+This will not compile! Why? Because `OnConnection` is a **member function**, and it requires a `this` context — otherwise it doesn't know which `RpcProvider` instance to call it on.
+
+🧩 The Role of `std::bind`
+
+To solve that, we do this:
+
+```c++
+server->setConnectionCallback(std::bind(&RpcProvider::OnConnection, this, std::placeholders::_1));
+```
+
+Now what happens:
+
+- `std::bind` "wraps" the `OnConnection` member function
+- It **binds the `this` pointer**, so that when `TcpServer` triggers the callback, it knows which `RpcProvider` instance to invoke it on
+- It also **reserves space** for arguments (`_1`, `_2`, etc.) to be filled in later when Muduo calls it
+
+
+
+about `std::placehoders::_1`:
+
+You **never manually call `OnMessage()`**. Instead, Muduo:
+
+1. **Monitors the TCP socket** using epoll (or similar mechanism).
+
+2. When **data arrives** on that socket:
+
+   - It reads the data into a `muduo::net::Buffer`.
+   - It records a `muduo::Timestamp` of when the data was received.
+
+3. Then it **calls your callback** like this:
+
+   ```c++
+   OnMessage(conn, buffer, receiveTime);
+   ```
+
+This happens automatically inside Muduo’s networking engine after you register the callback:
+
+```c++
+m_muduo_server->setMessageCallback(
+    std::bind(&RpcProvider::OnMessage, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+```
+
+
+
+### KvServer
+
+`KvServer` acts as a **middle component** between the **Raft node** and the **key-value database (kvDB)**.
+
+**only the leader** should communicate with the **key-value (KV) database** (i.e., the state machine) under normal operation. once committed, the leader applies the log to the state machine (kv store)
+
+```C++
+std::shared_pte<LockQueue<ApplyMsg>>applyChan;//Downstream communication with the Raft node, done via a thread-safe queue
+std::unordered_map<std::string,std::string>m_kvDB;//Upstream communication with kvDB
+```
+
+Both `KvServer` and the Raft class hold a reference to `applyChan`, enabling **bidirectional communication**.
+
+
+
+handle external requests:
+
+1. **Receive external requests** (from the client/`Clerk`).
+2. **Coordinate locally** with Raft and kvDB to process the request.
+3. **Return the response** to the client.
+
+- For external communication (steps 1 and 3), although you can use HTTP or custom protocols, **RPC is used**, since a simple RPC implementation is already available.
+- RPC takes care of both request handling and response, allowing `KvServer` to focus only on internal logic.
+
+
+
+```c++
+  void PutAppend(google::protobuf::RpcController *controller, const ::raftKVRpcProctoc::PutAppendArgs *request,
+                 ::raftKVRpcProctoc::PutAppendReply *response, ::google::protobuf::Closure *done) override;
+
+  void Get(google::protobuf::RpcController *controller, const ::raftKVRpcProctoc::GetArgs *request,
+           ::raftKVRpcProctoc::GetReply *response, ::google::protobuf::Closure *done) override;
+```
+
+- The `Clerk` (client) calls `PutAppend` for write operations and `Get` for read operations.
+- Internally, these RPCs interact with Raft to replicate and commit operations, then apply them to the local kvDB.
+
+### Linearizability
+
+Linearizability (or **strong consistency**) means:
+
+- Operations from clients are executed in an order that matches their **real-world time order**.
+- If **Client A’s operation finishes before Client B’s operation starts**, the system must reflect that order.
+- **Each read must return the most recent write** result.
+
+In simpler terms:
+
+> **Non-concurrent operations** must appear in the order they were issued, and each read sees the latest committed write.
+
+To reason about this, think of each operation (e.g., a GET or PUT) as a **time interval** (from request sent to response received). Internally, the actual execution is a **point in time** somewhere within that interval. Linearizability ensures that the operations are **consistent with real-time order** based on those intervals.
+
+📌 How Does Raft Ensure Linearizability?
+
+Raft ensures this via:
+
+- Every **client** has a unique ID.
+- Each command from a client has an incrementing **Request ID**.
+- Raft nodes track previously applied commands (using `ClientId + RequestId`) to:
+  - **Avoid duplicate executions**
+  - Ensure **idempotency**
+
+✏️ How Writes (Put/Append) Maintain Linearizability
+
+Key logic for handling writes in `KvServer`:
+
+1. The operation is **sent to Raft**, which attempts to replicate it.
+2. The server **waits for confirmation** via `applyChan` (a thread-safe queue).
+3. If the operation times out:
+   - If it was a **duplicate request**, return success.
+   - Otherwise, **return `ErrWrongLeader`** to make the client retry elsewhere.
+4. If confirmation is received:
+   - **Double-check the `ClientId` and `RequestId`** to ensure no log overwrites occurred during a leader change.
+
+> ✅ The write is considered successful **only if it is committed by a quorum of Raft nodes**, not just stored on one node.
+
+🔍 How Reads (Get) Maintain Linearizability
+
+Reads are trickier. The steps:
+
+1. **Send the GET request as a normal command** to Raft.
+2. Wait for it to be committed and applied (ensuring linearizability).
+3. If timeout happens:
+   - If the operation is **a duplicate and the server is still leader**, execute it again. Since it's a read, repeating it is safe.
+   - Otherwise, return `ErrWrongLeader`.
+
+> 📌 Reads are **repeatable and side-effect-free**, so re-execution (if already applied) **does not violate linearizability**.
+
+🧩 Summary of GET Request Handling
+
+- `KvServer::Get` (RPC method) receives the GET call from the client (`Clerk`).
+- An `Op` object is created and passed to Raft.
+- If this node is **not the leader**, respond with `ErrWrongLeader`.
+- If this node is the leader:
+  - It tracks the operation by its **log index** using `waitApplyCh`.
+  - Waits for the operation to be **applied to the state machine** via `applyChan`.
+  - Upon success, the value is fetched and returned.
+  - If timeout:
+    - If it’s a duplicate request, retry locally.
+    - Otherwise, return `ErrWrongLeader`.
+
+> Cleanup of `waitApplyCh` is done after response is sent to avoid holding the lock too long.
+
+
+
+
+
+`LockQueue<T>` is a **concurrent queue** that:
+
+- Supports safe **push** (send) and **pop** (receive) from **multiple threads**.
+- Typically implemented using:
+  - `std::queue<T>` or `std::deque<T>` for storage
+  - `std::mutex` for locking
+  - `std::condition_variable` for blocking waits
+
+It's often used for **producer-consumer patterns**, or in Raft-based systems, to **wait for commands to be committed** (like Go's `chan Op`).
+
+
+
+**Only the leader handles both read and write requests** to ensure **linearizability** (strong consistency).
+
+
+
+### Clerk
+
+The **Clerk** essentially acts as an **external client**. Its role is to **send commands to the entire Raft cluster and receive responses**.
+
+If the RPC response indicates that the target server is not the leader, the Clerk must retry by calling another kvserver’s RPC until it finds the leader.
+
+This is to **ensure that there are no conflicts during read/write operations**.
+
+
+
+### Skip list
+
+- Search: O(logn)
+- Insertion: O(logn)
+
+init
+
+![image-20250506153149442](assets/image-20250506153149442.png)
+
+search
+
+![image-20250506153903413](assets/image-20250506153903413.png)
+
+insertion
+
+ ![image-20250506154443307](assets/image-20250506154443307.png)
+
+elements always in increasing order
+
+1. Modify `dump` and `load` Interfaces
+
+The class `SkipListDump<K, V>` is added specifically for **safe serialization and deserialization**.
+
+It’s simple in design and uses Boost serialization just like in `raft` and `kvServer`.
+
+```c++
+template<typename K, typename V>
+class SkipListDump {
+public:
+    friend class boost::serialization::access;
+
+    template<class Archive>
+    void serialize(Archive &ar, const unsigned int version) {
+        ar & keyDumpVt_;
+        ar & valDumpVt_;
+    }
+
+    std::vector<K> keyDumpVt_;
+    std::vector<V> valDumpVt_;
+
+public:
+    void insert(const Node<K, V> &node);
+};
+```
+
+2. Add `void insert_set_element(K&, V&)` to `skipList`
+
+This method is added to align with the semantics of the `set` method used in the lower-level `KVServer`:
+
+> If the key doesn’t exist, add it; if it does, **update** its value.
+
+
+
+### LockQueue
+
+```c++
+template <typename T>
+class LockQueue {
+ public:
+  // 多个worker线程都会写日志queue
+  void Push(const T& data) {
+    std::lock_guard<std::mutex> lock(m_mutex);  //使用lock_gurad，即RAII的思想保证锁正确释放
+    m_queue.push(data);
+    m_condvariable.notify_one(); // It wakes up one thread that is currently waiting on the associated std::condition_variable.
+  }
+
+  // 一个线程读日志queue，写日志文件
+  T Pop() {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    while (m_queue.empty()) {
+      // 日志队列为空，线程进入wait状态
+      m_condvariable.wait(lock);  //这里用unique_lock是因为lock_guard不支持解锁，而unique_lock支持
+    }
+    T data = m_queue.front();
+    m_queue.pop();
+    return data;
+  }
+
+  bool timeOutPop(int timeout, T* ResData)  // 添加一个超时时间参数，默认为 50 毫秒
+  {
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    // 获取当前时间点，并计算出超时时刻
+    auto now = std::chrono::system_clock::now();
+    auto timeout_time = now + std::chrono::milliseconds(timeout);
+
+    // 在超时之前，不断检查队列是否为空
+    while (m_queue.empty()) {
+      // 如果已经超时了，就返回一个空对象
+      if (m_condvariable.wait_until(lock, timeout_time) == std::cv_status::timeout) {
+        return false;
+      } else {
+        continue;
+      }
+    }
+
+    T data = m_queue.front();
+    m_queue.pop();
+    *ResData = data;
+    return true;
+  }
+
+ private:
+  std::queue<T> m_queue;
+  std::mutex m_mutex;
+  std::condition_variable m_condvariable;
+};
+// 两个对锁的管理用到了RAII的思想，防止中途出现问题而导致资源无法释放的问题！！！
+// std::lock_guard 和 std::unique_lock 都是 C++11 中用来管理互斥锁的工具类，它们都封装了 RAII（Resource Acquisition Is
+// Initialization）技术，使得互斥锁在需要时自动加锁，在不需要时自动解锁，从而避免了很多手动加锁和解锁的繁琐操作。
+// std::lock_guard 是一个模板类，它的模板参数是一个互斥量类型。当创建一个 std::lock_guard
+// 对象时，它会自动地对传入的互斥量进行加锁操作，并在该对象被销毁时对互斥量进行自动解锁操作。std::lock_guard
+// 不能手动释放锁，因为其所提供的锁的生命周期与其绑定对象的生命周期一致。 std::unique_lock
+// 也是一个模板类，同样的，其模板参数也是互斥量类型。不同的是，std::unique_lock 提供了更灵活的锁管理功能。可以通过
+// lock()、unlock()、try_lock() 等方法手动控制锁的状态。当然，std::unique_lock 也支持 RAII
+// 技术，即在对象被销毁时会自动解锁。另外， std::unique_lock 还支持超时等待和可中断等待的操作。
+```
+
+
+
+`m_condvariable.wait(lock);`
+
+**This call atomically**:
+
+1. **Unlocks** the mutex `lock`.
+2. **Puts the thread to sleep**, waiting for a `notify_one()` or `notify_all()`.
+3. When notified, the thread **wakes up** and **relocks** the mutex before returning.
+
+After being woken up, the thread **goes back to the top of the `while` loop** and **checks the condition again**.
+
+It only re-checks the condition when:
+
+- It is **notified** (`notify_one` or `notify_all`)
+- OR **spuriously** woken up (a rare event — which is why the `while` is needed)
+
+| Method         | Behavior                             | When to use                                  |
+| -------------- | ------------------------------------ | -------------------------------------------- |
+| `Pop()`        | Waits forever for data               | When you must wait until something arrives   |
+| `timeOutPop()` | Waits for a limited time, then exits | When you want responsiveness or can time out |
+
+### DeferClass
+
+```c++
+template <class F>
+class DeferClass {
+ public:
+  DeferClass(F&& f) : m_func(std::forward<F>(f)) {}
+  DeferClass(const F& f) : m_func(f) {}
+  ~DeferClass() { m_func(); }  // <- calls the deferred function on destruction
+
+  DeferClass(const DeferClass& e) = delete;
+  DeferClass& operator=(const DeferClass& e) = delete;
+
+ private:
+  F m_func;
+};
+
+```
+
+and the macro works like:
+
+```c++
+#define _CONCAT(a, b) a##b  // Concatenates two tokens
+#define _MAKE_DEFER_(line) DeferClass _CONCAT(defer_placeholder, line) = [&]()
+#define DEFER _MAKE_DEFER_(__LINE__)
+```
+
+If you call `_CONCAT(hello, world)` → it becomes `helloworld`.
+
+`__LINE__` is a **built-in macro** that expands to the **current line number** in the source code.
+
+example:
+
+```c++
+void example() {
+  DEFER { std::cout << "1. Cleanup at end of scope\n"; };
+  DEFER { std::cout << "2. Another cleanup\n"; };
+
+  std::cout << "Doing work...\n";
+}
+
+```
+
+it'll become:
+
+```c++
+DeferClass defer_placeholder42 = [&]() { std::cout << "1. Cleanup at end of scope\n"; };
+DeferClass defer_placeholder43 = [&]() { std::cout << "2. Another cleanup\n"; };
+
+std::cout << "Doing work...\n";
+// When function returns or scope ends, both lambdas run (in reverse construction order)
+
+```
+
+
+
+### C++
+
+variadic argument: `void DPrintf(const char* format, ...);`
+
+```c++
+void DPrintf(const char *format, ...) {
+  if (Debug) {
+    time_t now = time(nullptr);
+    tm *nowtm = localtime(&now);
+    va_list args;
+    va_start(args, format);
+    std::printf("[%d-%d-%d-%d-%d-%d] ", nowtm->tm_year + 1900, nowtm->tm_mon + 1, nowtm->tm_mday, nowtm->tm_hour,
+                nowtm->tm_min, nowtm->tm_sec);
+    std::vprintf(format, args);
+    std::printf("\n");
+    va_end(args);
+  }
+}
+```
+
+C++20 can write like this:
+
+```c++
+template<typename... Args> // I’m defining a template that can take any number of types, and I’ll call them collectively Args
+void DPrintf(const std::string& format_str, Args&&... args) { // This function takes a format string, and then any number of arguments of any type, and forwards them safely。
+    if (Debug) {
+        // Get current time
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+        std::tm* now_tm = std::localtime(&now_c);
+
+        // Print timestamp
+        std::cout << std::format("[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] ",
+            now_tm->tm_year + 1900,
+            now_tm->tm_mon + 1,
+            now_tm->tm_mday,
+            now_tm->tm_hour,
+            now_tm->tm_min,
+            now_tm->tm_sec
+        );
+
+        // Print the formatted message
+        std::cout << std::vformat(format_str, std::make_format_args(args...)) << "\n";
+    }
+}
+```
+
+| Usage                     | `...` Location            | Meaning                             |
+| ------------------------- | ------------------------- | ----------------------------------- |
+| `typename... Args`        | after `typename`          | declare template parameter pack     |
+| `Args... args`            | after the type            | function parameter pack             |
+| `Args&&... args`          | for perfect forwarding    | function parameter pack (universal) |
+| `func(args...)`           | after the variable name   | expand values in a function call    |
+| `other_template<Args...>` | in template instantiation | expand types in another template    |
+
+
+
+ **declaring `m_mutex` only gives you the lock object**—it doesn’t actually lock anything. That's why we need to use `lock_guard` and `unique_lock`.
+
+🔐 `std::lock_guard`
+
+Summary:
+
+- **Lightweight**, simple.
+- Locks the mutex **immediately** on construction and **releases** on destruction.
+- **No unlock/relock**, no deferred locking.
+
+Example:
+
+```c++
+std::mutex mtx;
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    // critical section
+} // mutex is automatically released here
+```
+
+Key Features:
+
+- Very fast and minimal.
+- Best when you just want to **lock and unlock** a mutex without complications.
+
+🔄 `std::unique_lock`
+
+Summary:
+
+- **More flexible** than `lock_guard`.
+- Supports:
+  - **deferred locking** (`std::defer_lock`)
+  - **try-locking**
+  - **unlocking and re-locking**
+  - works with `std::condition_variable`
+
+Example:
+
+```c++
+std::mutex mtx;
+{
+    std::unique_lock<std::mutex> lock(mtx); // locks immediately
+    // can manually unlock and relock
+    lock.unlock();
+    // do something
+    lock.lock();
+}
+```
+
+Another Example (deferred lock):
+
+```c++
+std::unique_lock<std::mutex> lock(mtx, std::defer_lock);
+// some logic
+lock.lock(); // lock when ready
+```
+
+
+
+| Statement                                                  | Does it lock? | Notes                                |
+| ---------------------------------------------------------- | ------------- | ------------------------------------ |
+| `std::unique_lock<std::mutex> lock(mtx);`                  | ✅ Yes         | Locks immediately                    |
+| `std::unique_lock<std::mutex> lock(mtx, std::defer_lock);` | ❌ No          | You must call `lock.lock()` manually |
